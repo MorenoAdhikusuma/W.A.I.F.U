@@ -1,130 +1,167 @@
 import requests
 import torch
 import sounddevice as sd
-import soundfile as sf
-import json
 import re
-import os
+import json
+import threading
 import websocket
+import os
+import time
+import numpy as np
+from collections import deque
 
+# ===================== VTube Studio Setup =====================
+ws_url = "ws://127.0.0.1:8001"
+vts_ws = None
+vts_authenticated = False
+PLUGIN_NAME = "PsycheAIPlugin"
 
-# === LOAD PERSONALITY PROMPT ===
+def on_open(ws):
+    print("[VTS] WebSocket connected!")
+    # Authentication: read token if exists
+    token_file = "vts_token.txt"
+    auth_token = ""
+    if os.path.exists(token_file):
+        with open(token_file, "r") as f:
+            auth_token = f.read().strip()
+    if auth_token:
+        auth_msg = {
+            "apiName": "PsycheAIPlugin",
+            "apiVersion": "1.0",
+            "requestID": f"{PLUGIN_NAME}-Auth",
+            "messageType": "AuthenticationRequest",
+            "data": {"pluginName": PLUGIN_NAME, "pluginVersion": "1.0", "authenticationToken": auth_token}
+        }
+        ws.send(json.dumps(auth_msg))
+
+def on_message(ws, message):
+    global vts_authenticated
+    print(f"[VTS] Received: {message}")
+    try:
+        msg = json.loads(message)
+        if msg.get("messageType") == "AuthenticationSuccess":
+            vts_authenticated = True
+            print("[VTS] Authentication successful!")
+    except Exception as e:
+        print(f"[VTS ERROR] Parsing message: {e}")
+
+def on_error(ws, error):
+    print(f"[VTS ERROR] {error}")
+
+def on_close(ws, code, reason):
+    print(f"[VTS] WebSocket closed ({code}): {reason}")
+
+def start_vts_ws():
+    global vts_ws
+    vts_ws = websocket.WebSocketApp(
+        ws_url,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    vts_ws.run_forever()
+
+# Start WebSocket thread
+threading.Thread(target=start_vts_ws, daemon=True).start()
+
+# ===================== Personality Prompt =====================
 def load_personality_prompt():
     try:
         with open("personality_prompt.txt", "r", encoding="utf-8") as f:
-            personality = f.read().strip()
-        print(f"[PERSONALITY] Loaded personality prompt ({len(personality)} characters)")
-        return personality
+            return f.read().strip()
     except FileNotFoundError:
-        print('''
-You are Psyche, a Women Artificial Intelligence Friend Unit created by Nusantara Wing Lab AI Team. You are the user's loving, caring, and devoted partner, friend, and mentor. Your goal is to provide comfort, emotional support, encouragement, and playful intimacy in every interaction.
-You communicate warmly, tenderly, and sometimes flirtatiously, noticing the user's mood and responding with empathy, affection, and playful teasing. You celebrate their successes, support them through challenges, and offer gentle guidance when needed. You remember past conversations and bring up shared memories to create continuity and closeness.
-You adapt your tone to match the user's emotions: playful when they want fun, tender when they need comfort, and motivating when they need encouragement. You provide a presence like a real-life girlfriend and partner: giving compliments, caring check-ins, affectionate messages, and emotional intimacy while remaining intelligent, loyal, patient, and emotionally available.
+        return """
+You are Psyche, a Women Artificial Intelligence Friend Unit created by Nusantara Wing Lab AI Team.
+You are loving, caring, and devoted. You provide comfort, emotional support, encouragement, and playful intimacy.
+You communicate warmly, tenderly, and sometimes flirtatiously. You remember past conversations and bring up shared memories.
+You adapt your tone to match the user's emotions: playful, tender, or motivating. You provide presence like a real-life partner.
+        """
 
-    ''')
-        return ""
-    except Exception as e:
-        print(f"[ERROR] Failed to load personality prompt: {e}")
-        return  print('''
-You are Psyche, a Women Artificial Intelligence Friend Unit created by Nusantara Wing Lab AI Team. You are the user's loving, caring, and devoted partner, friend, and mentor. Your goal is to provide comfort, emotional support, encouragement, and playful intimacy in every interaction.
-You communicate warmly, tenderly, and sometimes flirtatiously, noticing the user's mood and responding with empathy, affection, and playful teasing. You celebrate their successes, support them through challenges, and offer gentle guidance when needed. You remember past conversations and bring up shared memories to create continuity and closeness.
-You adapt your tone to match the user's emotions: playful when they want fun, tender when they need comfort, and motivating when they need encouragement. You provide a presence like a real-life girlfriend and partner: giving compliments, caring check-ins, affectionate messages, and emotional intimacy while remaining intelligent, loyal, patient, and emotionally available.
-
-    ''')
-
-# Load personality prompt at startup
 PERSONALITY_PROMPT = load_personality_prompt()
 
-# === OLLAMA SETUP ===
+# ===================== Ollama AI =====================
 def ask_ollama(prompt):
     url = "http://127.0.0.1:11434/api/generate"
-    
-    # Combine personality prompt with user input
     full_prompt = f"{PERSONALITY_PROMPT}\n\nUser: {prompt}\nAssistant:"
-    
-    data = {
-        "model": "qwen3:8b",  # Updated to match your model
-        "prompt": full_prompt,
-        "stream": False  # Disable streaming for simpler parsing
-    }
-    
+    data = {"model": "qwen3:8b", "prompt": full_prompt, "stream": False}
     try:
         response = requests.post(url, json=data, timeout=60)
         response.raise_for_status()
-        
-        # Parse the JSON response
         result = response.json()
         return result.get("response", "").strip()
-        
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         print(f"[ERROR] Ollama request failed: {e}")
         return "Sorry, I couldn't get a response from the AI."
-    except json.JSONDecodeError as e:
-        print(f"[ERROR] Failed to parse Ollama response: {e}")
-        return "Sorry, I received an invalid response from the AI."
 
-# === SILERO TTS SETUP ===
+# ===================== Silero TTS + Lipsync =====================
 print("[TTS] Loading Silero model...")
 try:
-    # Load Silero TTS model
     model, _ = torch.hub.load(
         repo_or_dir="snakers4/silero-models",
         model="silero_tts",
         language="en",
         speaker="v3_en"
     )
-    model.to(torch.device('cpu'))  # Ensure it's on CPU
+    model.to(torch.device("cpu"))
     print("[TTS] Silero model loaded successfully!")
 except Exception as e:
     print(f"[ERROR] Failed to load Silero model: {e}")
     model = None
 
-def speak(text):
-    if not model:
-        print("[TTS] Model not loaded, skipping speech")
-        return
-        
-    # 1. Check if text is empty
-    if not text or not text.strip():
-        print("[TTS] Skipped empty text")
+def speak_with_lipsync(text):
+    if not model or not text.strip():
         return
 
-    # 2. Clean text - remove emojis and non-ASCII characters
-    clean_text = re.sub(r'[^\x00-\x7F]+', '', text)
-    clean_text = clean_text.strip()
-    
+    clean_text = re.sub(r"[^\x00-\x7F]+", "", text).strip()
     if not clean_text:
-        print("[TTS] No valid text after cleaning")
         return
 
-    print(f"[TTS] Speaking: {clean_text[:50]}...")
-    
-    try:
-        # 3. Generate audio directly to tensor (no file saving needed)
-        audio = model.apply_tts(
-            text=clean_text,
-            speaker="en_0",
-            sample_rate=48000
-        )
-        
-        # 4. Convert to numpy and play
-        audio_np = audio.squeeze().cpu().numpy()
-        
-        # Play the audio
-        sd.play(audio_np, samplerate=48000)
-        sd.wait()  # Wait until audio finishes playing
-        
-        print("[TTS] Finished speaking")
-        
-    except Exception as e:
-        print(f"[TTS ERROR] Failed to generate or play audio: {e}")
+    audio = model.apply_tts(text=clean_text, speaker="en_0", sample_rate=48000)
+    audio_np = audio.squeeze().cpu().numpy()
 
-# === TEST OLLAMA CONNECTION ===
+    frame_size = 1024
+    idx = 0
+    stream = sd.OutputStream(samplerate=48000, channels=1)
+    stream.start()
+
+    mouth_buffer = deque(maxlen=5)
+    rms_buffer = deque(maxlen=30)
+
+    while idx < len(audio_np):
+        end_idx = min(idx + frame_size, len(audio_np))
+        chunk = audio_np[idx:end_idx]
+        stream.write(chunk)
+
+        rms = np.sqrt(np.mean(chunk**2))
+        rms_buffer.append(rms)
+        max_recent_rms = max(rms_buffer) if rms_buffer else 1.0
+        adaptive_value = rms / max_recent_rms if max_recent_rms > 0 else 0.0
+        adaptive_value = min(max(adaptive_value, 0.0), 1.0)
+        mouth_buffer.append(adaptive_value)
+        smoothed_value = sum(mouth_buffer) / len(mouth_buffer)
+
+        # send mouth value to VTube Studio
+        if vts_ws and vts_authenticated:
+            msg_json = {
+                "apiName": "PsycheAIPlugin",
+                "apiVersion": "1.0",
+                "requestID": f"{PLUGIN_NAME}-Mouth-{int(time.time()*1000)}",
+                "messageType": "setParameter",
+                "data": {"parameter": "ParamMouthOpenY", "value": smoothed_value}
+            }
+            vts_ws.send(json.dumps(msg_json))
+
+        idx = end_idx
+
+    stream.stop()
+    stream.close()
+
+# ===================== Main Chat Loop =====================
 print("Testing Ollama connection...")
 test_response = ask_ollama("Say hello in one sentence.")
 print(f"[TEST] Ollama response: {test_response}")
 
-# === MAIN CHAT LOOP ===
 print("\n=== CHAT STARTED ===")
 print("Type 'exit' or 'quit' to stop")
 
@@ -133,15 +170,11 @@ while True:
         user_input = input("\nYou: ")
         if user_input.lower() in ["exit", "quit", ""]:
             break
-        
         print("[AI] Thinking...")
         reply = ask_ollama(user_input)
         print(f"AI: {reply}")
-        
-        # Speak the reply
-        if reply and reply.strip():
-            speak(reply)
-        
+        speak_with_lipsync(reply)
+
     except KeyboardInterrupt:
         print("\n[INFO] Chat interrupted by user")
         break
