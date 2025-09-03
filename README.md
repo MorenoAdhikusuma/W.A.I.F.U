@@ -2,7 +2,7 @@ W.A.I.F.U – Women Artificial Intelligence Friend Unit
 
 Overview:
 W.A.I.F.U is an AI chatbot application designed to provide interactive and personalized conversations. It leverages the Qwen3:8B model via the Ollama framework to deliver engaging dialogues.
-GitHub
+
 
 🔧 Features
 
